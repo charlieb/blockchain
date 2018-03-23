@@ -21,9 +21,9 @@ def txt_pub(txt):
     txt = b'-----BEGIN PUBLIC KEY-----\n' + txt[:64] + b'\n' + txt[64:64+56] + b'==\n-----END PUBLIC KEY-----\n'
     return load_pem_public_key(txt, default_backend())
 
-def address(key):
+def address(pubkey):
     hasher = Hash(SHA224(), openssl_backend)
-    hasher.update(pub_txt(key.public_key()))
+    hasher.update(pub_txt(pubkey))
     return b64encode(hasher.finalize())[:-2]
 
 def sign(prvkey, message):
@@ -37,10 +37,20 @@ def verify(pubkey, signature, message):
 
 #---------------------------------------
 
-def add_tx(bc, inputs, outputs):
-    txid = len(bc)
-    bc.append({'txid': txid, 'inputs': inputs, 'outputs': outputs})
-    return txid
+def add_tx(bc, tx):
+    tx['txid'] = len(bc)
+    bc.append(tx)
+    return tx['txid']
+
+def mk_tx(inputs, pubkeys, outputs):
+    return {'inputs': inputs, 'pubkeys': pubkeys, 'outputs': outputs}
+
+def to_sign(tx):
+    return b''.join(str(x).encode() for x in tx['inputs'] + tx['pubkeys'] + tx['outputs'])
+
+def sign_tx(tx, prvkeys):
+    message = to_sign(tx)
+    tx['signatures'] = [sign(key, message) for key in prvkeys]
 
 def mk_input(txid, output):
     return {'txid': txid, 'output': output}
@@ -75,10 +85,23 @@ def verify_chain(bc):
 
 def test():
     bc = []
-    add_tx(bc, [], [mk_output('one', 100)])
-    add_tx(bc, [mk_input(0, 0)], [mk_output('two', 75), mk_output('three', 25)])
-    add_tx(bc, [mk_input(1, 0)], [mk_output('three', 30), mk_output('four', 45)])
-    add_tx(bc, [mk_input(2, 0)], [mk_output('four', 15)])
+    a,b,c = new_key(), new_key(), new_key()
+
+    tx = mk_tx([], [], [mk_output(address(a.public_key()), 100)])
+    add_tx(bc, tx)
+
+    tx = mk_tx([mk_input(0, 0)], 
+               [pub_txt(a.public_key())],
+               [mk_output(address(b.public_key()), 75), mk_output(address(c.public_key()), 25)])
+    sign_tx(tx, [a])
+    add_tx(bc, tx)
+
+    tx = mk_tx([mk_input(1, 0)],
+               [pub_txt(b.public_key())],
+               [mk_output(address(b.public_key()), 35), mk_output(address(c.public_key()), 40)])
+    sign_tx(tx, [b])
+    add_tx(bc, tx)
+
     print(bc)
     print(verify_chain(bc))
 
@@ -87,7 +110,7 @@ def test():
     key = new_key()
     print(prv_txt(key))
     print(pub_txt(key.public_key()))
-    print(address(key))
+    print(address(key.public_key()))
     print(pub_txt(key.public_key()) == pub_txt(txt_pub(pub_txt(key.public_key()))))
 
     message = b'This is a test'
