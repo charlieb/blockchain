@@ -37,6 +37,9 @@ def verify(pubkey, signature, message):
 
 #---------------------------------------
 
+def get_tx(bc, txid):
+    return bc[txid]
+
 def add_tx(bc, tx):
     tx['txid'] = len(bc)
     bc.append(tx)
@@ -57,6 +60,21 @@ def mk_input(txid, output):
 
 def mk_output(address, amount):
     return {'address': address, 'amount': amount}
+
+def verify_sig(bc, tx):
+    # Verify address of each input is derived from the corresponding public key
+    for inp, pubkey in zip(tx['inputs'], tx['pubkeys']):
+        if address(txt_pub(pubkey)) != get_tx(bc, inp['txid'])['outputs'][inp['output']]['address']:
+            print('Invalid Tx - pubkey to address mismatch\n%s'%tx)
+            return False
+
+
+    # Verify that each signature is correct for the tx body and the public key
+    for sig, pubkey in zip(tx['signatures'], tx['pubkeys']):
+        message = to_sign(tx)
+        if not verify(txt_pub(pubkey), sig, message):
+            print('Invalid Tx - bad signature\n%s'%tx)
+            return False
 
 def verify_chain(bc):
     utxos = set()
@@ -95,6 +113,7 @@ def test():
                [mk_output(address(b.public_key()), 75), mk_output(address(c.public_key()), 25)])
     sign_tx(tx, [a])
     add_tx(bc, tx)
+    verify_sig(bc, tx)
 
     tx = mk_tx([mk_input(1, 0)],
                [pub_txt(b.public_key())],
