@@ -2,7 +2,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.backends.openssl import backend as openssl_backend
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption, load_pem_public_key
-from cryptography.hazmat.primitives.hashes import Hash, SHA224
+from cryptography.hazmat.primitives.hashes import Hash, SHA224, SHA256
 from cryptography.exceptions import InvalidSignature
 from base64 import b64encode, b64decode
 import random
@@ -27,8 +27,14 @@ def address(pubkey):
     hasher.update(pub_txt(pubkey))
     return b64encode(hasher.finalize())[:-2]
 
+def sha256(data):
+    hasher = Hash(SHA256(), openssl_backend)
+    hasher.update(data)
+    return hasher.finalize()
+
 def sign(prvkey, message):
     return b64encode(prvkey.sign(message, ec.ECDSA(SHA224())))
+
 def verify(pubkey, signature, message):
     try:
         pubkey.verify(b64decode(signature), message, ec.ECDSA(SHA224()))
@@ -58,6 +64,9 @@ def mk_tx(inputs, pubkeys, outputs):
 
 def to_sign(tx):
     return b''.join(str(x).encode() for x in tx['inputs'] + tx['pubkeys'] + tx['outputs'])
+
+def to_hash(tx):
+    return b''.join(str(x).encode() for x in tx['inputs'] + tx['pubkeys'] + tx['outputs'] + tx['signatures'])
 
 def sign_tx(tx, prvkeys):
     message = to_sign(tx)
@@ -109,6 +118,8 @@ def verify_tx(bc, tx):
 
     return True
 
+# --------------------------------------
+
 def try_add_tx(bc, tx):
     txid = add_tx(bc, tx)
     if txid is None:
@@ -143,6 +154,67 @@ def gen_tx(bc, addr_keys):
 def sum_utxos(bc):
     return sum(get_tx(bc, utxo[0])['outputs'][utxo[1]]['amount'] for utxo in bc['utxos'])
 
+# ---------------------------------------
+
+def mk_block(bc, txes):
+    return {
+            'header': {
+                'number': len(bc['blocks']),
+                'prev_block_hash': 0,
+                'merkle_root': 0,
+                'difficulty': 1,
+                'nonce': 0
+                },
+            'txes': [],
+            'merkle_tree': []
+            }
+
+def coinbase_tx(bc, address):
+    return mk_tx([], [], mk_output(address, 100000))
+
+def mk_merkle_tree(txes):
+    def mk_merkle_r(tree):
+        print('mk_merkel_r: %s'%len(tree))
+        if len(tree) == 1: return tree
+        new_tree = []
+        first = None
+        for tx in tree:
+            if first is None:
+                first = tx
+            else:
+                new_tree.append([first, tx, sha256(first[-1] + tx[-1])])
+                first = None
+        if first is not None:
+            new_tree.append([first, first, sha256(first[-1]*2)])
+
+        return mk_merkle_r(new_tree)
+
+    return mk_merkle_r([(tx, sha256(to_hash(tx))) for tx in txes])[0]
+
+def hash_header(block):
+    h = block['header']
+    return sha256(b''.join([
+        str(h['number']).encode(),
+        h['prev_block_hash'],
+        h['merkle_root'],
+        str(h['difficulty']).encode(),
+        str(h['nonce']).encode()
+        ]))
+
+
+def solve_block(block):
+    mask = int('1'*block['header']['difficulty'], 2)
+    block['header']['nonce'] = 0
+    while int.from_bytes(hash_header(block), byteorder='big') & mask:
+        print(hash_header(block))
+        #print('nonce: %s -> %s'%(block['header']['nonce'], int.from_bytes(hash_header(block), byteorder='big') & mask))
+        block['header']['nonce'] += 1
+    #print('nonce: %s -> %s'%(block['header']['nonce'], int.from_bytes(hash_header(block), byteorder='big') & mask))
+    print(block['header'])
+
+
+# ---------------------------------------
+
 def test():
     bc = {'blocks': [], 'txes': {}, 'utxos': set()}
 
@@ -158,9 +230,28 @@ def test():
     try_add_tx(bc, tx)
     print(sum_utxos(bc))
 
-    for _ in range(500):
+    for _ in range(50):
         gen_tx(bc, addr_keys)
         print(sum_utxos(bc))
+
+    mtree = mk_merkle_tree(bc['blocks'])
+    print(mtree[-1])
+
+    block = {'header': {
+                'number': 0,
+                'prev_block_hash': b'',
+                'merkle_root': mtree[-1],
+                'difficulty': 10,
+                'nonce': 0
+                },
+            }
+
+    block['header']['prev_block_hash'] = b'\xda\xa2\xca\xbb\x14\x01\xf5\xbei\xb3u\xf3\xba\x0e\x81\x86\xac\x8c\xdc\xbbW\xce\xed\x8bcv6u\xd4\xc4\x90t'
+    solve_block(block)
+    
+    block['header']['prev_block_hash'] = b'\xda\xa2\xca\xbb\x14\x01\xf5\xbej\xb3u\xf3\xba\x0e\x81\x86\xac\x8c\xdc\xbbW\xce\xed\x8bcv6u\xd4\xc4\x90t'
+    solve_block(block)
+
 
 
 
