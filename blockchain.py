@@ -206,11 +206,24 @@ def solve_block(block):
     mask = int('1'*block['header']['difficulty'], 2)
     block['header']['nonce'] = 0
     while int.from_bytes(hash_header(block), byteorder='big') & mask:
-        print(hash_header(block))
         #print('nonce: %s -> %s'%(block['header']['nonce'], int.from_bytes(hash_header(block), byteorder='big') & mask))
         block['header']['nonce'] += 1
     #print('nonce: %s -> %s'%(block['header']['nonce'], int.from_bytes(hash_header(block), byteorder='big') & mask))
     print(block['header'])
+
+def verify_block_header(block):
+    mask = int('1'*block['header']['difficulty'], 2)
+    if int.from_bytes(hash_header(block), byteorder='big') & mask:
+        print('Invalid Block: header hash does not meet diffulty \n%s'%block['header'])
+        return False
+
+    mroot = mk_merkle_tree(block['txes'])[-1]
+    if mroot != block['header']['merkle_root']:
+        print('Invalid Block: bad merkle root calculated %s, block has %s\n%s'%(mroot,
+            block['header']['merkle_root'], block['header']))
+        return False
+
+    return True
 
 
 # ---------------------------------------
@@ -244,6 +257,7 @@ def test():
                 'difficulty': 10,
                 'nonce': 0
                 },
+                'txes': bc['blocks']
             }
 
     block['header']['prev_block_hash'] = b'\xda\xa2\xca\xbb\x14\x01\xf5\xbei\xb3u\xf3\xba\x0e\x81\x86\xac\x8c\xdc\xbbW\xce\xed\x8bcv6u\xd4\xc4\x90t'
@@ -251,6 +265,8 @@ def test():
     
     block['header']['prev_block_hash'] = b'\xda\xa2\xca\xbb\x14\x01\xf5\xbej\xb3u\xf3\xba\x0e\x81\x86\xac\x8c\xdc\xbbW\xce\xed\x8bcv6u\xd4\xc4\x90t'
     solve_block(block)
+
+    print(verify_block_header(block))
 
 
 
