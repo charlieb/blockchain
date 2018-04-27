@@ -6,6 +6,7 @@ from cryptography.hazmat.primitives.hashes import Hash, SHA224, SHA256
 from cryptography.exceptions import InvalidSignature
 from base64 import b64encode, b64decode
 import random
+from copy import deepcopy
 
 def new_key():
     return ec.generate_private_key(ec.SECP256K1, default_backend())
@@ -44,18 +45,18 @@ def verify(pubkey, signature, message):
 
 #---------------------------------------
 
-def get_tx(bc, txid):
-    return bc['txes'][txid]
+def get_tx(state, txid):
+    return state['txes'][txid]
 
-def add_tx(bc, tx):
-    if not verify_tx(bc, tx):
+def add_tx(state, block, tx):
+    if not verify_tx(state, tx):
         return None
-    tx['txid'] = len(bc['blocks'])
-    bc['blocks'].append(tx)
+    tx['txid'] = txid(tx)
+    block['txes'].append(tx)
 
-    bc['txes'][tx['txid']] = tx
-    bc['utxos'] -= set((inp['txid'], inp['output']) for inp in tx['inputs'])
-    bc['utxos'] |= set((tx['txid'], i) for i,_ in enumerate(tx['outputs']))
+    state['txes'][tx['txid']] = tx
+    state['utxos'] -= set((inp['txid'], inp['output']) for inp in tx['inputs'])
+    state['utxos'] |= set((tx['txid'], i) for i,_ in enumerate(tx['outputs']))
 
     return tx['txid']
 
@@ -78,10 +79,10 @@ def mk_input(txid, output):
 def mk_output(address, amount):
     return {'address': address, 'amount': amount}
 
-def verify_sig(bc, tx):
+def verify_sig(state, tx):
     # Verify address of each input is derived from the corresponding public key
     for inp, pubkey in zip(tx['inputs'], tx['pubkeys']):
-        if address(txt_pub(pubkey)) != get_tx(bc, inp['txid'])['outputs'][inp['output']]['address']:
+        if address(txt_pub(pubkey)) != get_tx(state, inp['txid'])['outputs'][inp['output']]['address']:
             print('Invalid Tx - pubkey to address mismatch\n%s'%tx)
             return False
 
@@ -93,35 +94,47 @@ def verify_sig(bc, tx):
             return False
     return True
 
-def verify_tx(bc, tx):
+def verify_tx(state, tx):
     # Validate and sum inputs
     in_amt = 0
     spent = []
     for inp in tx['inputs']:
         utxo = (inp['txid'], inp['output'])
-        if utxo not in bc['utxos'] or utxo in spent:
+        if utxo not in state['utxos'] or utxo in spent:
             print('Invalid Tx - double spend of %s:%s:\n%s'%(inp['txid'], inp['output'], tx))
             return False
-        in_amt += bc['txes'][inp['txid']]['outputs'][inp['output']]['amount']
+        in_amt += state['txes'][inp['txid']]['outputs'][inp['output']]['amount']
         spent.append(utxo)
 
-    # Sum outputs
-    out_amt = sum(out['amount'] for out in tx['outputs'])
+    # ensure all outputs a positive and # Sum outputs
+    out_amt = 0
+    for out in tx['outputs']:
+        if out['amount'] < 0:
+            print('Invalid Tx - output amount less than zero:\n%s'%tx)
+            return False
+        out_amt += out['amount']
 
     # must be enough in inputs or no inputs at all for a special tx
     if in_amt < out_amt and tx['inputs'] != []:
         print('Invalid Tx - output > input:\n%s'%tx)
         return False
 
-    if not verify_sig(bc, tx):
+    if not verify_sig(state, tx):
         return False
 
     return True
 
+def txid(tx):
+    return b64encode(
+            sha256(b''.join(str(x).encode() for x in tx['inputs'] +
+                                                     tx['pubkeys'] +
+                                                     tx['outputs'] +
+                                                     tx['signatures'])))
+
 # --------------------------------------
 
-def try_add_tx(bc, tx):
-    txid = add_tx(bc, tx)
+def try_add_tx(state, block, tx):
+    txid = add_tx(state, block, tx)
     if txid is None:
         print('Add tx failed')
         return False
@@ -129,11 +142,11 @@ def try_add_tx(bc, tx):
         print('Added tx %s'%txid)
         return True
 
-def gen_tx(bc, addr_keys):
+def gen_tx(state, block, addr_keys):
     keys = [new_key() for _ in range(random.randint(1,5))]
-    utxos = random.sample(tuple(bc['utxos']), random.randint(1,min(len(bc['utxos']), 5)))
+    utxos = random.sample(tuple(state['utxos']), random.randint(1,min(len(state['utxos']), 5)))
 
-    outputs = [get_tx(bc, utxo[0])['outputs'][utxo[1]] for utxo in utxos]
+    outputs = [get_tx(state, utxo[0])['outputs'][utxo[1]] for utxo in utxos]
     utxo_keys = [addr_keys[out['address']] for out in outputs]
 
     total = sum(out['amount'] for out in outputs)
@@ -145,7 +158,7 @@ def gen_tx(bc, addr_keys):
                [mk_output(address(k.public_key()), amt) for k, amt in zip(keys, amts)])
     sign_tx(tx, utxo_keys)
     
-    if not try_add_tx(bc, tx):
+    if not try_add_tx(state, block, tx):
         print('gen_tx Failed')
         return False
 
@@ -156,10 +169,10 @@ def sum_utxos(bc):
 
 # ---------------------------------------
 
-def mk_block(bc, txes):
+def mk_block(bc):
     return {
             'header': {
-                'number': len(bc['blocks']),
+                'number': len(bc),
                 'prev_block_hash': 0,
                 'merkle_root': 0,
                 'difficulty': 1,
@@ -169,8 +182,9 @@ def mk_block(bc, txes):
             'merkle_tree': []
             }
 
-def coinbase_tx(bc, address):
-    return mk_tx([], [], mk_output(address, 100000))
+def coinbase_tx(state, block, address):
+    if block['txes'] != []: return None
+    return add_tx(state, block, mk_tx([], [], [mk_output(address, 100000)]))
 
 def mk_merkle_tree(txes):
     def mk_merkle_r(tree):
@@ -229,44 +243,34 @@ def verify_block_header(block):
 # ---------------------------------------
 
 def test():
-    bc = {'blocks': [], 'txes': {}, 'utxos': set()}
+    state = {'txes': {}, 'utxos': set()}
+    bc = []
+    new_block = mk_block(bc)
+    new_state = deepcopy(state)
 
-    a,b,c = new_key(), new_key(), new_key()
-    addr_keys = { 
-            address(a.public_key()): a,
-            address(b.public_key()): b,
-            address(c.public_key()): c,
-            }
+    a = new_key()
+    tx = coinbase_tx(new_state, new_block, address(a.public_key()))
+    print(sum_utxos(new_state))
+    print(new_block['txes'], new_state)
 
-
-    tx = mk_tx([], [], [mk_output(address(a.public_key()), 1000000)])
-    try_add_tx(bc, tx)
-    print(sum_utxos(bc))
-
+    addr_keys = {address(a.public_key()): a}
     for _ in range(50):
-        gen_tx(bc, addr_keys)
-        print(sum_utxos(bc))
+        gen_tx(new_state, new_block, addr_keys)
+        print(sum_utxos(new_state))
 
-    mtree = mk_merkle_tree(bc['blocks'])
+    mtree = mk_merkle_tree(new_block['txes'])
     print(mtree[-1])
 
-    block = {'header': {
-                'number': 0,
-                'prev_block_hash': b'',
-                'merkle_root': mtree[-1],
-                'difficulty': 10,
-                'nonce': 0
-                },
-                'txes': bc['blocks']
-            }
+    new_block['header']['merkle_root'] = mtree[-1]
+    new_block['header']['difficulty'] = 10
 
-    block['header']['prev_block_hash'] = b'\xda\xa2\xca\xbb\x14\x01\xf5\xbei\xb3u\xf3\xba\x0e\x81\x86\xac\x8c\xdc\xbbW\xce\xed\x8bcv6u\xd4\xc4\x90t'
-    solve_block(block)
+    new_block['header']['prev_block_hash'] = b'\xda\xa2\xca\xbb\x14\x01\xf5\xbei\xb3u\xf3\xba\x0e\x81\x86\xac\x8c\xdc\xbbW\xce\xed\x8bcv6u\xd4\xc4\x90t'
+    solve_block(new_block)
     
-    block['header']['prev_block_hash'] = b'\xda\xa2\xca\xbb\x14\x01\xf5\xbej\xb3u\xf3\xba\x0e\x81\x86\xac\x8c\xdc\xbbW\xce\xed\x8bcv6u\xd4\xc4\x90t'
-    solve_block(block)
+    new_block['header']['prev_block_hash'] = b'\xda\xa2\xca\xbb\x14\x01\xf5\xbej\xb3u\xf3\xba\x0e\x81\x86\xac\x8c\xdc\xbbW\xce\xed\x8bcv6u\xd4\xc4\x90t'
+    solve_block(new_block)
 
-    print(verify_block_header(block))
+    print(verify_block_header(new_block))
 
 
 
