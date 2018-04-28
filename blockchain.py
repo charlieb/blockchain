@@ -48,16 +48,18 @@ def verify(pubkey, signature, message):
 def get_tx(state, txid):
     return state['txes'][txid]
 
+def update_state_tx(state, tx):
+    state['txes'][tx['txid']] = tx
+    state['utxos'] -= set((inp['txid'], inp['output']) for inp in tx['inputs'])
+    state['utxos'] |= set((tx['txid'], i) for i,_ in enumerate(tx['outputs']))
+
 def add_tx(state, block, tx):
     if not verify_tx(state, tx):
         return None
     tx['txid'] = txid(tx)
     block['txes'].append(tx)
 
-    state['txes'][tx['txid']] = tx
-    state['utxos'] -= set((inp['txid'], inp['output']) for inp in tx['inputs'])
-    state['utxos'] |= set((tx['txid'], i) for i,_ in enumerate(tx['outputs']))
-
+    update_state_tx(state, tx)
     return tx['txid']
 
 def mk_tx(inputs, pubkeys, outputs):
@@ -205,7 +207,7 @@ def mk_merkle_tree(txes):
 
     return mk_merkle_r([(tx, sha256(to_hash(tx))) for tx in txes])[0]
 
-def hash_header(block):
+def hash_header_raw_bytes(block):
     h = block['header']
     return sha256(b''.join([
         str(h['number']).encode(),
@@ -215,11 +217,14 @@ def hash_header(block):
         str(h['nonce']).encode()
         ]))
 
+def hash_header(block):
+    return b64encode(hash_header_raw_bytes(block))
+
 
 def solve_block(block):
     mask = int('1'*block['header']['difficulty'], 2)
     block['header']['nonce'] = 0
-    while int.from_bytes(hash_header(block), byteorder='big') & mask:
+    while int.from_bytes(hash_header_raw_bytes(block), byteorder='big') & mask:
         #print('nonce: %s -> %s'%(block['header']['nonce'], int.from_bytes(hash_header(block), byteorder='big') & mask))
         block['header']['nonce'] += 1
     #print('nonce: %s -> %s'%(block['header']['nonce'], int.from_bytes(hash_header(block), byteorder='big') & mask))
@@ -227,7 +232,7 @@ def solve_block(block):
 
 def verify_block_header(block):
     mask = int('1'*block['header']['difficulty'], 2)
-    if int.from_bytes(hash_header(block), byteorder='big') & mask:
+    if int.from_bytes(hash_header_raw_bytes(block), byteorder='big') & mask:
         print('Invalid Block: header hash does not meet diffulty \n%s'%block['header'])
         return False
 
@@ -236,6 +241,23 @@ def verify_block_header(block):
         print('Invalid Block: bad merkle root calculated %s, block has %s\n%s'%(mroot,
             block['header']['merkle_root'], block['header']))
         return False
+
+    return True
+
+def verify_block(state, bc, block):
+    if not verify_block_header(block): return False
+    if block['header']['number'] > 0 and block['header']['prev_block_hash'] != header_hash(bc[block['header']['number']-1]):
+        print('Invalid Block: prev_block_hash incorrect\n%s'%block['header'])
+        return False
+
+    for tx in block['txes']:
+        if not verify_tx(state, tx):
+            print('Invalid Block: bad tx\n%s'%block['header'])
+            return False
+        if txid(tx) != tx['txid']:
+            print('Invalid Block: bad txid %s\n%s'%(tx['txid'], block['header']))
+            return False
+        update_state_tx(state, tx)
 
     return True
 
@@ -266,13 +288,8 @@ def test():
 
     new_block['header']['prev_block_hash'] = b'\xda\xa2\xca\xbb\x14\x01\xf5\xbei\xb3u\xf3\xba\x0e\x81\x86\xac\x8c\xdc\xbbW\xce\xed\x8bcv6u\xd4\xc4\x90t'
     solve_block(new_block)
-    
-    new_block['header']['prev_block_hash'] = b'\xda\xa2\xca\xbb\x14\x01\xf5\xbej\xb3u\xf3\xba\x0e\x81\x86\xac\x8c\xdc\xbbW\xce\xed\x8bcv6u\xd4\xc4\x90t'
-    solve_block(new_block)
 
-    print(verify_block_header(new_block))
-
-
+    print(verify_block(state, [], new_block))
 
 
 if __name__ == '__main__':
