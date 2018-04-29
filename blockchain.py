@@ -7,6 +7,7 @@ from cryptography.exceptions import InvalidSignature
 from base64 import b64encode, b64decode
 import random
 from copy import deepcopy
+import json
 
 def new_key():
     return ec.generate_private_key(ec.SECP256K1, default_backend())
@@ -152,7 +153,12 @@ def gen_tx(state, block, addr_keys):
     utxo_keys = [addr_keys[out['address']] for out in outputs]
 
     total = sum(out['amount'] for out in outputs)
-    dividers = sorted(random.sample(range(1, total), len(keys) - 1))
+    try:
+        dividers = sorted(random.sample(range(1, total), len(keys) - 1))
+    except ValueError:
+        print('Value Error on sample: keys %s'%keys)
+        raise
+
     amts = [a - b for a, b in zip(dividers + [total], [0] + dividers)]
     
     tx = mk_tx([mk_input(tx, out) for tx,out in utxos],
@@ -198,14 +204,14 @@ def mk_merkle_tree(txes):
             if first is None:
                 first = tx
             else:
-                new_tree.append([first, tx, sha256(first[-1] + tx[-1])])
+                new_tree.append([first, tx, b64encode(sha256(first[-1] + tx[-1]))])
                 first = None
         if first is not None:
-            new_tree.append([first, first, sha256(first[-1]*2)])
+            new_tree.append([first, first, b64encode(sha256(first[-1]*2))])
 
         return mk_merkle_r(new_tree)
 
-    return mk_merkle_r([(tx, sha256(to_hash(tx))) for tx in txes])[0]
+    return mk_merkle_r([(tx, b64encode(sha256(to_hash(tx)))) for tx in txes])[0]
 
 def hash_header_raw_bytes(block):
     h = block['header']
@@ -261,8 +267,35 @@ def verify_block(state, bc, block):
 
     return True
 
+# ---------------------------------------
+
+class JSONEncodeBytes(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, bytes):
+            print(obj)
+            return obj.decode('utf-8') #{'__bytes__': str(obj)}
+        else:
+            return super().default(obj)
+
+def write_block(f, block):
+    f.write(json.dumps(block, cls=JSONEncodeBytes))
+
+class JSONDecodeBytes(json.JSONDecoder):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, object_hook=self.object_hook, **kwargs)
+
+    def object_hook(self, obj):
+        if isinstance(obj, str):
+            return obj.encode('utf-8')
+        else:
+            return obj
+
+def read_block(f):
+    return json.loads(f.read(), cls=JSONDecodeBytes)
 
 # ---------------------------------------
+
+import filecmp
 
 def test():
     state = {'txes': {}, 'utxos': set()}
@@ -286,10 +319,17 @@ def test():
     new_block['header']['merkle_root'] = mtree[-1]
     new_block['header']['difficulty'] = 10
 
-    new_block['header']['prev_block_hash'] = b'\xda\xa2\xca\xbb\x14\x01\xf5\xbei\xb3u\xf3\xba\x0e\x81\x86\xac\x8c\xdc\xbbW\xce\xed\x8bcv6u\xd4\xc4\x90t'
+    new_block['header']['prev_block_hash'] = b''
     solve_block(new_block)
 
     print(verify_block(state, [], new_block))
+    print(new_block['header'])
+
+    with open('test_block.json', 'w') as f: write_block(f, new_block)
+    with open('test_block.json', 'r') as f: new_block2 = read_block(f)
+    with open('test_block2.json', 'w') as f: write_block(f, new_block2)
+
+    print(filecmp.cmp('test_block.json', 'test_block2.json'))
 
 
 if __name__ == '__main__':
