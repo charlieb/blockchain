@@ -1,7 +1,7 @@
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.backends.openssl import backend as openssl_backend
-from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption, load_pem_public_key
+from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption, load_pem_public_key, load_pem_private_key
 from cryptography.hazmat.primitives.hashes import Hash, SHA224, SHA256
 from cryptography.exceptions import InvalidSignature
 from base64 import b64encode, b64decode
@@ -16,12 +16,16 @@ def prv_txt(key):
     txt = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
     return b''.join(txt.split(b'\n')[1:-2])
 
+def txt_prv(txt):
+    txt = b'-----BEGIN PRIVATE KEY-----\n' + txt[:64] + b'\n' + txt[64:] + b'\n-----END PRIVATE KEY-----\n'
+    return load_pem_private_key(txt, None, default_backend())
+
 def pub_txt(key):
     txt = key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
-    return b''.join(txt.split(b'\n')[1:-2])[:-2]
+    return b''.join(txt.split(b'\n')[1:-2])
 
 def txt_pub(txt):
-    txt = b'-----BEGIN PUBLIC KEY-----\n' + txt[:64] + b'\n' + txt[64:64+56] + b'==\n-----END PUBLIC KEY-----\n'
+    txt = b'-----BEGIN PUBLIC KEY-----\n' + txt[:64] + b'\n' + txt[64:] + b'\n-----END PUBLIC KEY-----\n'
     return load_pem_public_key(txt, default_backend())
 
 def address(pubkey):
@@ -150,7 +154,7 @@ def gen_tx(state, block, addr_keys):
     utxos = random.sample(tuple(state['utxos']), random.randint(1,min(len(state['utxos']), 5)))
 
     outputs = [get_tx(state, utxo[0])['outputs'][utxo[1]] for utxo in utxos]
-    utxo_keys = [addr_keys[out['address']] for out in outputs]
+    utxo_keys = [txt_prv(addr_keys[out['address']]) for out in outputs]
 
     total = sum(out['amount'] for out in outputs)
     try:
@@ -170,7 +174,7 @@ def gen_tx(state, block, addr_keys):
         print('gen_tx Failed')
         return False
 
-    for k in keys: addr_keys[address(k.public_key())] = k
+    for k in keys: addr_keys[address(k.public_key())] = prv_txt(k)
 
 def sum_utxos(bc):
     return sum(get_tx(bc, utxo[0])['outputs'][utxo[1]]['amount'] for utxo in bc['utxos'])
@@ -187,7 +191,6 @@ def mk_block(bc):
                 'nonce': 0
                 },
             'txes': [],
-            'merkle_tree': []
             }
 
 def coinbase_tx(state, block, address):
@@ -196,7 +199,7 @@ def coinbase_tx(state, block, address):
 
 def mk_merkle_tree(txes):
     def mk_merkle_r(tree):
-        print('mk_merkel_r: %s'%len(tree))
+        #print('mk_merkel_r: %s'%len(tree))
         if len(tree) == 1: return tree
         new_tree = []
         first = None
@@ -251,86 +254,106 @@ def verify_block_header(block):
     return True
 
 def verify_block(state, bc, block):
+    new_state = deepcopy(state)
+
     if not verify_block_header(block): return False
-    if block['header']['number'] > 0 and block['header']['prev_block_hash'] != header_hash(bc[block['header']['number']-1]):
+    if block['header']['number'] > 0 and block['header']['prev_block_hash'] != hash_header(bc[block['header']['number']-1]):
         print('Invalid Block: prev_block_hash incorrect\n%s'%block['header'])
         return False
 
     for tx in block['txes']:
-        if not verify_tx(state, tx):
+        if not verify_tx(new_state, tx):
             print('Invalid Block: bad tx\n%s'%block['header'])
             return False
         if txid(tx) != tx['txid']:
             print('Invalid Block: bad txid %s\n%s'%(tx['txid'], block['header']))
             return False
-        update_state_tx(state, tx)
+        update_state_tx(new_state, tx)
 
-    return True
+    return True, new_state
 
 # ---------------------------------------
 
-class JSONEncodeBytes(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, bytes):
-            print(obj)
-            return obj.decode('utf-8') #{'__bytes__': str(obj)}
-        else:
-            return super().default(obj)
+def default(obj):
+    if isinstance(obj, bytes):
+        return obj.decode('utf-8') #{'__bytes__': str(obj)}
 
-def write_block(f, block):
-    f.write(json.dumps(block, cls=JSONEncodeBytes))
+def write_from_bytes(f, data):
+    json.dump(data, f, default=default, indent=4)
 
-class JSONDecodeBytes(json.JSONDecoder):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, object_hook=self.object_hook, **kwargs)
+def object_hook(obj):
+    # the only base data type we care about
+    if isinstance(obj, str): return obj.encode('utf-8')
 
-    def object_hook(self, obj):
-        if isinstance(obj, str):
-            return obj.encode('utf-8')
-        else:
-            return obj
+    if isinstance(obj, dict):
+        for k,v in obj.items():
+            obj[k] = object_hook(obj[k])
+    elif isinstance(obj, list):
+        obj = [object_hook(o) for o in obj]
 
-def read_block(f):
-    return json.loads(f.read(), cls=JSONDecodeBytes)
+    return obj
+
+def read_to_bytes(f):
+    return json.load(f, object_hook=object_hook)
 
 # ---------------------------------------
 
 import filecmp
+class BadBlockException(Exception): pass
+
+def new_random_block(state, bc, addr_keys):
+    new_block = mk_block(bc)
+    new_state = deepcopy(state)
+    new_addr_keys = deepcopy(addr_keys)
+
+    new_block['header']['number'] = len(bc)
+    new_block['header']['prev_block_hash'] = hash_header(bc[-1]) if new_block['header']['number'] > 0 else b''
+    new_block['header']['difficulty'] = 10
+
+    # use new_state to keep generated txes correct
+    a = new_key()
+    tx = coinbase_tx(new_state, new_block, address(a.public_key()))
+
+    new_addr_keys[address(a.public_key())] = prv_txt(a)
+    for _ in range(50):
+        gen_tx(new_state, new_block, new_addr_keys)
+
+    mtree = mk_merkle_tree(new_block['txes'])
+
+    new_block['header']['merkle_root'] = mtree[-1]
+    solve_block(new_block)
+
+    # use state to update it for real
+    ok, new_state = verify_block(state, bc, new_block)
+    if not ok: raise BadBlockException
+    return new_state, bc + [new_block], new_addr_keys
+
+def read_addr_keys(f):
+    return {addr.encode('utf-8'): key for addr, key in read_to_bytes(f).items()}
+def write_addr_keys(f, keys):
+    write_from_bytes(f, {addr.decode('utf-8'): key for addr, key in keys.items()})
 
 def test():
     state = {'txes': {}, 'utxos': set()}
     bc = []
-    new_block = mk_block(bc)
-    new_state = deepcopy(state)
+    addr_keys = {}
 
-    a = new_key()
-    tx = coinbase_tx(new_state, new_block, address(a.public_key()))
-    print(sum_utxos(new_state))
-    print(new_block['txes'], new_state)
+    try:
+        with open('test_block.json', 'r') as f: bc = read_to_bytes(f)
+        with open('addr_keys', 'r') as f: addr_keys = read_addr_keys(f)
+    except FileNotFoundError:
+        pass
+    
+    state, bc, addr_keys = new_random_block(state, bc, addr_keys)
 
-    addr_keys = {address(a.public_key()): a}
-    for _ in range(50):
-        gen_tx(new_state, new_block, addr_keys)
-        print(sum_utxos(new_state))
-
-    mtree = mk_merkle_tree(new_block['txes'])
-    print(mtree[-1])
-
-    new_block['header']['merkle_root'] = mtree[-1]
-    new_block['header']['difficulty'] = 10
-
-    new_block['header']['prev_block_hash'] = b''
-    solve_block(new_block)
-
-    print(verify_block(state, [], new_block))
-    print(new_block['header'])
-
-    with open('test_block.json', 'w') as f: write_block(f, new_block)
-    with open('test_block.json', 'r') as f: new_block2 = read_block(f)
-    with open('test_block2.json', 'w') as f: write_block(f, new_block2)
+    with open('test_block.json', 'w') as f: write_from_bytes(f, bc)
+    with open('test_block.json', 'r') as f: new_bc = read_to_bytes(f)
+    print(new_bc[0]['header'])
+    with open('test_block2.json', 'w') as f: write_from_bytes(f, new_bc)
 
     print(filecmp.cmp('test_block.json', 'test_block2.json'))
 
+    with open('addr_keys', 'w') as f: write_addr_keys(f, addr_keys)
 
 if __name__ == '__main__':
     test()
